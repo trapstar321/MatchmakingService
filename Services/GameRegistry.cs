@@ -7,6 +7,13 @@ using MatchmakingService.Models;
 
 namespace MatchmakingService.Services;
 
+internal enum JoinGameResult
+{
+    Success,
+    NotFound,
+    InvalidCredential
+}
+
 internal enum SessionOperationResult
 {
     Success,
@@ -27,7 +34,9 @@ internal sealed class GameRegistry(
     private readonly int _maxActiveSessions = Math.Max(1, options.Value.MaxActiveSessions);
     private readonly int _maxSessionsPerIp = Math.Max(1, options.Value.MaxSessionsPerIp);
 
-    internal GameRegistration Register(string playerName, string gameName, IPAddress? sourceAddress)
+    internal GameRegistration Register(string playerName, string gameName, IPAddress? sourceAddress) => Register(playerName, gameName, "public", null, sourceAddress);
+
+    internal GameRegistration Register(string playerName, string gameName, string gameType, string? joinSecret, IPAddress? sourceAddress)
     {
         lock (_gate)
         {
@@ -44,7 +53,7 @@ internal sealed class GameRegistry(
             var secret = Convert.ToBase64String(secretBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
             var secretHash = SHA256.HashData(Encoding.UTF8.GetBytes(secret));
             CryptographicOperations.ZeroMemory(secretBytes);
-            var game = new HostedGame(Guid.NewGuid(), playerName, gameName, now, now);
+            var game = new HostedGame(Guid.NewGuid(), playerName, gameName, gameType, joinSecret, now, now);
             while (_games.ContainsKey(game.SessionId))
             {
                 game = game with { SessionId = Guid.NewGuid() };
@@ -66,6 +75,24 @@ internal sealed class GameRegistry(
         }
     }
 
+    internal JoinGameResult AuthorizeJoin(Guid sessionId, string? suppliedSecret, out HostedGame? game)
+    {
+        lock (_gate)
+        {
+            game = null;
+            if (!_games.TryGetValue(sessionId, out var session)) return JoinGameResult.NotFound;
+            if (IsExpired(session.Game, timeProvider.GetUtcNow()))
+            {
+                Remove(sessionId, session, "Expired hosted game");
+                return JoinGameResult.NotFound;
+            }
+            if (session.Game.GameType == "private" && !HasValidJoinSecret(suppliedSecret, session.Game.Secret))
+                return JoinGameResult.InvalidCredential;
+            game = session.Game;
+            return JoinGameResult.Success;
+        }
+    }
+
     internal SessionOperationResult Heartbeat(Guid sessionId, string ownerSecret)
     {
         lock (_gate)
@@ -83,7 +110,6 @@ internal sealed class GameRegistry(
             return SessionOperationResult.Success;
         }
     }
-
     internal SessionOperationResult Delete(Guid sessionId, string ownerSecret)
     {
         lock (_gate)
@@ -122,6 +148,13 @@ internal sealed class GameRegistry(
     private bool IsExpired(HostedGame game, DateTimeOffset now) =>
         now - game.LastHeartbeatUtc >= _expirationTimeout;
 
+    private static bool HasValidJoinSecret(string? supplied, string? expected)
+    {
+        if (supplied is null || expected is null) return false;
+        var suppliedHash = SHA256.HashData(Encoding.UTF8.GetBytes(supplied));
+        var expectedHash = SHA256.HashData(Encoding.UTF8.GetBytes(expected));
+        return CryptographicOperations.FixedTimeEquals(suppliedHash, expectedHash);
+    }
     private static bool HasValidSecret(string secret, byte[] expectedHash)
     {
         var suppliedHash = SHA256.HashData(Encoding.UTF8.GetBytes(secret));

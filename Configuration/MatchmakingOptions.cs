@@ -11,6 +11,8 @@ public sealed class MatchmakingOptions
     public int MaxRequestHeadersTotalSize { get; set; } = 8 * 1024;
     public int MaxAuthorizationHeaderBytes { get; set; } = 512;
     public int MaxConcurrentConnections { get; set; } = 256;
+    public string? TokenSigningKey { get; set; }
+    public long TokenExpiry { get; set; } = 300;
     public RateLimitOptions RateLimits { get; set; } = new();
 }
 

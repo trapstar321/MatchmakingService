@@ -6,6 +6,7 @@ public sealed record CreateGameResponse(
     string OwnerSecret,
     string PlayerName,
     string GameName,
+    string GameType,
     DateTimeOffset CreatedAtUtc)
 {
     internal static CreateGameResponse From(GameRegistration registration) => new(
@@ -13,5 +14,6 @@ public sealed record CreateGameResponse(
         registration.OwnerSecret,
         registration.Game.PlayerName,
         registration.Game.GameName,
+        registration.Game.GameType,
         registration.Game.CreatedAtUtc);
 }

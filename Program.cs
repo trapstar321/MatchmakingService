@@ -20,9 +20,10 @@ builder.WebHost.ConfigureKestrel(server =>
     server.Limits.MaxConcurrentConnections = Math.Max(1, settings.MaxConcurrentConnections);
     server.Limits.Http2.MaxStreamsPerConnection = 100;
 });
-builder.Services.Configure<MatchmakingOptions>(builder.Configuration.GetSection(MatchmakingOptions.SectionName));
+builder.Services.AddOptions<MatchmakingOptions>().Bind(builder.Configuration.GetSection(MatchmakingOptions.SectionName)).Validate(options => !string.IsNullOrWhiteSpace(options.TokenSigningKey) && Encoding.UTF8.GetByteCount(options.TokenSigningKey) >= 32, "Matchmaking:TokenSigningKey is required and must contain at least 32 UTF-8 bytes.").Validate(options => options.TokenExpiry > 0, "Matchmaking:TokenExpiry must be a positive number of seconds.").ValidateOnStart();
 builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
 builder.Services.AddSingleton<GameRegistry>();
+builder.Services.AddSingleton<TokenService>();
 builder.Services.AddHostedService<GameCleanupService>();
 builder.Services.AddRateLimiter(rateLimiter =>
 {
@@ -33,6 +34,7 @@ builder.Services.AddRateLimiter(rateLimiter =>
         return PerIpPartition(context, limits.GlobalPermitLimit, limits.GlobalWindow);
     });
     rateLimiter.AddPolicy("create-game", context => PerIpPartition(context, GetRateLimits(context).CreatePermitLimit, GetRateLimits(context).CreateWindow));
+    rateLimiter.AddPolicy("join-game", context => PerIpPartition(context, GetRateLimits(context).CreatePermitLimit, GetRateLimits(context).CreateWindow));
     rateLimiter.AddPolicy("list-games", context => PerIpPartition(context, GetRateLimits(context).ListPermitLimit, GetRateLimits(context).ListWindow));
     rateLimiter.AddPolicy("heartbeat", context => PerIpPartition(context, GetRateLimits(context).HeartbeatPermitLimit, GetRateLimits(context).HeartbeatWindow));
     rateLimiter.AddPolicy("delete-game", context => PerIpPartition(context, GetRateLimits(context).DeletePermitLimit, GetRateLimits(context).DeleteWindow));
@@ -105,13 +107,13 @@ app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegi
     {
         return Results.ValidationProblem(new Dictionary<string, string[]>
         {
-            ["request"] = ["PlayerName and GameName are required and must be at most 64 and 100 characters respectively."]
+            ["request"] = ["PlayerName, GameName, and a valid gameType are required; private games also require a secret."]
         });
     }
 
     try
     {
-        var game = games.Register(request.PlayerName!.Trim(), request.GameName!.Trim(), context.Connection.RemoteIpAddress);
+        var game = games.Register(request.PlayerName!.Trim(), request.GameName!.Trim(), request.GameType!, request.GameType == "private" ? request.Secret : null, context.Connection.RemoteIpAddress);
         return Results.Created($"/games/{game.Game.SessionId}", CreateGameResponse.From(game));
     }
     catch (SessionCapacityExceededException)
@@ -120,6 +122,17 @@ app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegi
     }
 }).RequireRateLimiting("create-game");
 
+app.MapPost("/join", (JoinGameRequest? request, GameRegistry games, TokenService tokens) =>
+{
+    if (request is null || !Guid.TryParse(request.Session, out var sessionId))
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["session"] = ["A valid game session is required."] });
+    var authorization = games.AuthorizeJoin(sessionId, request.Secret, out var game);
+    if (authorization == JoinGameResult.NotFound) return Results.NotFound();
+    if (authorization == JoinGameResult.InvalidCredential)
+        return Results.Problem(statusCode: StatusCodes.Status403Forbidden, title: "The private game credentials are invalid.");
+    var token = tokens.Create(game!.SessionId, "C", game.GameType == "private" ? game.Secret : null);
+    return Results.Ok(new JoinGameResponse(token));
+}).RequireRateLimiting("join-game");
 app.MapGet("/games", (GameRegistry games) =>
     Results.Ok(games.GetActiveGames().Select(HostedGameResponse.From)))
     .RequireRateLimiting("list-games");

@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
@@ -124,6 +125,70 @@ public sealed class GamesApiTests : IClassFixture<GamesApiFactory>
             (await Heartbeat(registration.SessionId, registration.OwnerSecret)).StatusCode);
     }
 
+    [Fact]
+    public async Task Public_and_private_creation_listing_and_join_authorization_work()
+    {
+        var publicResponse = await _client.PostAsJsonAsync("/games", new { playerName = "PublicHost", gameName = "Open", gameType = "public" });
+        var publicJson = await publicResponse.Content.ReadAsStringAsync();
+        var publicGame = await publicResponse.Content.ReadFromJsonAsync<CreateGameResponse>();
+        Assert.Equal(HttpStatusCode.Created, publicResponse.StatusCode);
+        Assert.Equal("public", publicGame!.GameType);
+        Assert.DoesNotContain("\"secret\":", publicJson, StringComparison.OrdinalIgnoreCase);
+
+        const string joinSecret = "private-join-secret";
+        var privateResponse = await _client.PostAsJsonAsync("/games", new { playerName = "PrivateHost", gameName = "Closed", gameType = "private", secret = joinSecret });
+        var privateJson = await privateResponse.Content.ReadAsStringAsync();
+        var privateGame = await privateResponse.Content.ReadFromJsonAsync<CreateGameResponse>();
+        Assert.Equal(HttpStatusCode.Created, privateResponse.StatusCode);
+        Assert.Equal("private", privateGame!.GameType);
+        Assert.DoesNotContain(joinSecret, privateJson, StringComparison.Ordinal);
+
+        var invalidPrivate = await _client.PostAsJsonAsync("/games", new { playerName = "Bad", gameName = "No secret", gameType = "private" });
+        var invalidType = await _client.PostAsJsonAsync("/games", new { playerName = "Bad", gameName = "Bad type", gameType = "friends" });
+        Assert.Equal(HttpStatusCode.BadRequest, invalidPrivate.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, invalidType.StatusCode);
+
+        var listingResponse = await _client.GetAsync("/games");
+        var listingJson = await listingResponse.Content.ReadAsStringAsync();
+        var listing = await listingResponse.Content.ReadFromJsonAsync<HostedGameResponse[]>();
+        Assert.Equal("public", Assert.Single(listing!, g => g.SessionId == publicGame.SessionId).GameType);
+        Assert.Equal("private", Assert.Single(listing!, g => g.SessionId == privateGame.SessionId).GameType);
+        Assert.DoesNotContain(joinSecret, listingJson, StringComparison.Ordinal);
+
+        var noSecretPublicJoin = await _client.PostAsJsonAsync("/join", new { session = publicGame.SessionId });
+        Assert.True(noSecretPublicJoin.StatusCode == HttpStatusCode.OK, await noSecretPublicJoin.Content.ReadAsStringAsync());
+        var publicToken = (await noSecretPublicJoin.Content.ReadFromJsonAsync<JoinTokenResponse>())!.Token;
+        var publicClaims = DecodePayload(publicToken);
+        Assert.Equal("C", publicClaims.GetProperty("role").GetString());
+        Assert.Equal(publicGame.SessionId.ToString(), publicClaims.GetProperty("session").GetString());
+        Assert.Equal(JsonValueKind.Null, publicClaims.GetProperty("secretHash").ValueKind);
+
+        var missingSecretJoin = await _client.PostAsJsonAsync("/join", new { session = privateGame.SessionId });
+        var badSecretJoin = await _client.PostAsJsonAsync("/join", new { session = privateGame.SessionId, secret = "wrong" });
+        Assert.Equal(HttpStatusCode.Forbidden, missingSecretJoin.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, badSecretJoin.StatusCode);
+
+        var validPrivateJoin = await _client.PostAsJsonAsync("/join", new { session = privateGame.SessionId, secret = joinSecret });
+        var privateToken = (await validPrivateJoin.Content.ReadFromJsonAsync<JoinTokenResponse>())!.Token;
+        var privateClaims = DecodePayload(privateToken);
+        Assert.Equal("C", privateClaims.GetProperty("role").GetString());
+        Assert.Equal(privateGame.SessionId.ToString(), privateClaims.GetProperty("session").GetString());
+        Assert.Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(joinSecret))).ToLowerInvariant(), privateClaims.GetProperty("secretHash").GetString());
+        Assert.DoesNotContain(joinSecret, privateToken, StringComparison.Ordinal);
+
+        var missingGame = await _client.PostAsJsonAsync("/join", new { session = Guid.NewGuid() });
+        Assert.Equal(HttpStatusCode.NotFound, missingGame.StatusCode);
+        Assert.DoesNotContain("token", await missingGame.Content.ReadAsStringAsync(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static JsonElement DecodePayload(string token)
+    {
+        var payload = token.Split('.')[0].Replace('-', '+').Replace('_', '/');
+        payload += new string('=', (4 - payload.Length % 4) % 4);
+        return JsonDocument.Parse(Convert.FromBase64String(payload)).RootElement.Clone();
+    }
+
+    private sealed record JoinTokenResponse(string Token);
     private Task<HttpResponseMessage> Create(string player, string game) =>
         _client.PostAsJsonAsync("/games", new CreateGameRequest(player, game));
 
@@ -172,6 +237,8 @@ internal static class TestSettings
 {
     public static readonly Dictionary<string, string?> HighLimits = new()
     {
+        ["Matchmaking:TokenSigningKey"] = "test-only-signing-key-0123456789abcdef",
+        ["Matchmaking:TokenExpiry"] = "300",
         ["Matchmaking:MaxActiveSessions"] = "1000",
         ["Matchmaking:MaxSessionsPerIp"] = "1000",
         ["Matchmaking:MaxRequestBodyBytes"] = "2048",

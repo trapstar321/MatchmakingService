@@ -24,6 +24,8 @@ public sealed class GameRegistryTests
         Assert.NotEqual(first.OwnerSecret, second.OwnerSecret);
         Assert.Equal("Alice", first.Game.PlayerName);
         Assert.Equal("Arena", first.Game.GameName);
+        Assert.Equal("public", first.Game.GameType);
+        Assert.Null(first.Game.Secret);
         Assert.Equal(43, first.OwnerSecret.Length);
         Assert.Equal(new[] { first.Game.SessionId, second.Game.SessionId }.Order(), registry.GetActiveGames().Select(g => g.SessionId).Order());
     }
