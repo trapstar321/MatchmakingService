@@ -1,5 +1,7 @@
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.RateLimiting;
@@ -101,7 +103,7 @@ app.UseRateLimiter();
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
-app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegistry games) =>
+app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegistry games, TokenService tokens) =>
 {
     if (request is null || !CreateGameRequest.IsValid(request))
     {
@@ -114,7 +116,8 @@ app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegi
     try
     {
         var game = games.Register(request.PlayerName!.Trim(), request.GameName!.Trim(), request.GameType!, request.GameType == "private" ? request.Secret : null, context.Connection.RemoteIpAddress);
-        return Results.Created($"/games/{game.Game.SessionId}", CreateGameResponse.From(game));
+        var token = tokens.Create(game.Game.SessionId, "H");
+        return Results.Created($"/games/{game.Game.SessionId}", CreateGameResponse.From(game, token));
     }
     catch (SessionCapacityExceededException)
     {
@@ -130,7 +133,7 @@ app.MapPost("/join", (JoinGameRequest? request, GameRegistry games, TokenService
     if (authorization == JoinGameResult.NotFound) return Results.NotFound();
     if (authorization == JoinGameResult.InvalidCredential)
         return Results.Problem(statusCode: StatusCodes.Status403Forbidden, title: "The private game credentials are invalid.");
-    var token = tokens.Create(game!.SessionId, "C", game.GameType == "private" ? game.Secret : null);
+    var token = tokens.Create(game!.SessionId, "C");
     return Results.Ok(new JoinGameResponse(token));
 }).RequireRateLimiting("join-game");
 app.MapGet("/games", (GameRegistry games) =>
@@ -199,5 +202,62 @@ static IResult ToOperationResult(SessionOperationResult result) => result switch
     SessionOperationResult.InvalidCredential => Results.Problem(statusCode: StatusCodes.Status403Forbidden, title: "The owner credential is invalid."),
     _ => Results.NotFound()
 };
+
+// Tokens are signed, not encrypted. Verify the signature before returning the readable payload.
+static JsonDocument VerifyAndDecodeTokenPayload(string? token, string signingKey)
+{
+    if (string.IsNullOrEmpty(token)) throw new InvalidTokenException("Token is missing.");
+    if (string.IsNullOrWhiteSpace(signingKey) || Encoding.UTF8.GetByteCount(signingKey) < 32)
+        throw new ArgumentException("The signing key must contain at least 32 UTF-8 bytes.", nameof(signingKey));
+
+    var parts = token.Split('.');
+    if (parts.Length != 2 || parts[0].Length == 0 ||
+        !TryDecodeBase64Url(parts[0], out var payloadBytes) ||
+        !TryDecodeBase64Url(parts[1], out var suppliedSignature))
+        throw new InvalidTokenException("Token format is invalid.");
+
+    try
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(signingKey));
+        var expectedSignature = hmac.ComputeHash(Encoding.ASCII.GetBytes(parts[0]));
+        if (suppliedSignature.Length != expectedSignature.Length ||
+            !CryptographicOperations.FixedTimeEquals(suppliedSignature, expectedSignature))
+            throw new InvalidTokenException("Token signature is invalid.");
+
+        var payload = JsonDocument.Parse(payloadBytes);
+        var root = payload.RootElement;
+        
+        // validate expiry later
+        /*if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("expires", out var expiresElement) || !expiresElement.TryGetInt64(out var expires) ||
+            expires <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+        {
+            payload.Dispose();
+            throw new InvalidTokenException("Token payload is invalid or expired.");
+        }*/
+
+        return payload;
+    }
+    catch (JsonException exception) { throw new InvalidTokenException("Token payload is invalid.", exception); }
+}
+
+static bool TryDecodeBase64Url(string value, out byte[] bytes)
+{
+    bytes = [];
+    if (value.Length == 0 || value.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_')) || value.Length % 4 == 1)
+        return false;
+    try
+    {
+        var base64 = value.Replace('-', '+').Replace('_', '/');
+        base64 += new string('=', (4 - base64.Length % 4) % 4);
+        bytes = Convert.FromBase64String(base64);
+        return true;
+    }
+    catch (FormatException) { return false; }
+}
+
+sealed class InvalidTokenException(string message, Exception? innerException = null) : Exception(message, innerException);
+
+sealed record DecodeTokenRequest(string? Token);
 
 public partial class Program;

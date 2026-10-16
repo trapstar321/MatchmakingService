@@ -1,13 +1,12 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using MatchmakingService.Configuration;
 
 namespace MatchmakingService.Services;
 
-internal sealed record AuthorizationTokenClaims(string Session, string Role, long Expires, string? SecretHash);
+internal sealed record AuthorizationTokenClaims(string Session, string Role, long Expires);
 
 internal sealed class TokenService
 {
@@ -27,12 +26,11 @@ internal sealed class TokenService
         _clock = clock;
     }
 
-    internal string Create(Guid session, string role, string? privateSecret)
+    internal string Create(Guid session, string role)
     {
         if (role is not ("H" or "C")) throw new ArgumentException("Unsupported token role.", nameof(role));
         var expires = checked(_clock.GetUtcNow().ToUnixTimeSeconds() + _expiry);
-        var secretHash = privateSecret is null ? null : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(privateSecret))).ToLowerInvariant();
-        var payload = JsonSerializer.SerializeToUtf8Bytes(new { session = session.ToString(), role, expires, secretHash });
+        var payload = JsonSerializer.SerializeToUtf8Bytes(new { session = session.ToString(), role, expires });
         var encodedPayload = Base64UrlEncode(payload);
         using var hmac = new HMACSHA256(_key);
         return encodedPayload + "." + Base64UrlEncode(hmac.ComputeHash(Encoding.ASCII.GetBytes(encodedPayload)));
@@ -56,14 +54,9 @@ internal sealed class TokenService
                 string.IsNullOrWhiteSpace(sessionElement.GetString()) ||
                 !root.TryGetProperty("role", out var roleElement) || roleElement.ValueKind != JsonValueKind.String ||
                 roleElement.GetString() is not ("H" or "C") ||
-                !root.TryGetProperty("expires", out var expiresElement) || !expiresElement.TryGetInt64(out var expires) ||
-                !root.TryGetProperty("secretHash", out var hashElement)) return false;
-            string? hash;
-            if (hashElement.ValueKind == JsonValueKind.Null) hash = null;
-            else if (hashElement.ValueKind == JsonValueKind.String && Regex.IsMatch(hashElement.GetString()!, "^[0-9a-f]{64}$", RegexOptions.CultureInvariant)) hash = hashElement.GetString();
-            else return false;
+                !root.TryGetProperty("expires", out var expiresElement) || !expiresElement.TryGetInt64(out var expires)) return false;
             if (expires <= _clock.GetUtcNow().ToUnixTimeSeconds()) return false;
-            claims = new AuthorizationTokenClaims(sessionElement.GetString()!, roleElement.GetString()!, expires, hash);
+            claims = new AuthorizationTokenClaims(sessionElement.GetString()!, roleElement.GetString()!, expires);
             return true;
         }
         catch (JsonException) { return false; }

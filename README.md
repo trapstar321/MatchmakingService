@@ -52,7 +52,7 @@ Invoke-RestMethod -Method Post -Uri http://localhost:5080/join `
   -Body '{"session":"00000000-0000-0000-0000-000000000000","secret":"your-private-join-secret"}'
 ```
 
-The token format is `base64url(payload).base64url(signature)`. Its signed JSON payload has `session`, `role` (`C` for a joining client), `expires` (Unix seconds), and `secretHash` (lowercase SHA-256 hex for private games, otherwise `null`). The token is signed with HMAC-SHA-256 and is readable by its holder; it contains no original join secret.
+The token format is `base64url(payload).base64url(signature)`. Its signed JSON payload has `session`, `role` (`H` for the host or `C` for a joining client), and `expires` (Unix seconds). Private-game join secrets are checked by the matchmaking service before issuing a client token and are not included in the token. The token is signed with HMAC-SHA-256 and is readable by its holder.
 ### Heartbeat and stop hosting
 
 Pass the owner secret in an `Authorization: Bearer` header. A successful heartbeat or deletion returns `204 No Content`. Missing credentials return `401`, incorrect credentials return `403`, and unknown or expired sessions return `404`.

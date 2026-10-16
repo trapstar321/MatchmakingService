@@ -18,10 +18,9 @@ public sealed class TokenServiceTests
     {
         var clock = new FakeTimeProvider();
         var service = Create(clock);
-        var token = service.Create(Guid.NewGuid(), "C", "join-secret");
+        var token = service.Create(Guid.NewGuid(), "C");
         Assert.True(service.TryVerify(token, out var claims));
         Assert.Equal("C", claims!.Role);
-        Assert.NotNull(claims.SecretHash);
 
         var parts = token.Split('.');
         Assert.False(service.TryVerify(parts[0] + "x." + parts[1], out _));
@@ -45,12 +44,16 @@ public sealed class TokenServiceTests
     }
 
     [Fact]
-    public void Public_token_has_null_secret_hash_and_signature_is_hmac_sha256()
+    public void Token_has_session_role_expiry_and_signature_is_hmac_sha256()
     {
         var service = Create(new FakeTimeProvider());
-        var token = service.Create(Guid.NewGuid(), "C", null);
+        var token = service.Create(Guid.NewGuid(), "C");
         Assert.True(service.TryVerify(token, out var claims));
-        Assert.Null(claims!.SecretHash);
+        var encodedPayload = token.Split('.')[0].Replace('-', '+').Replace('_', '/');
+        encodedPayload += new string('=', (4 - encodedPayload.Length % 4) % 4);
+        using var document = System.Text.Json.JsonDocument.Parse(Convert.FromBase64String(encodedPayload));
+        Assert.Equal(3, document.RootElement.EnumerateObject().Count());
+        Assert.False(document.RootElement.TryGetProperty("secretHash", out _));
         Assert.Equal(32, Convert.FromBase64String(token.Split('.')[1].Replace('-', '+').Replace('_', '/') + "=").Length);
     }
     [Fact]
@@ -58,10 +61,9 @@ public sealed class TokenServiceTests
     {
         var service = Create(new FakeTimeProvider());
         Assert.False(service.TryVerify(SignPayload("{"), out _));
-        Assert.False(service.TryVerify(SignPayload("{\"session\":\"s\",\"role\":\"X\",\"expires\":9999999999,\"secretHash\":null}"), out _));
-        Assert.False(service.TryVerify(SignPayload("{\"session\":\" \",\"role\":\"C\",\"expires\":9999999999,\"secretHash\":null}"), out _));
-        Assert.False(service.TryVerify(SignPayload("{\"role\":\"C\",\"expires\":9999999999,\"secretHash\":null}"), out _));
-        Assert.False(service.TryVerify(SignPayload("{\"session\":\"s\",\"role\":\"C\",\"expires\":9999999999,\"secretHash\":\"ABC\"}"), out _));
+        Assert.False(service.TryVerify(SignPayload("{\"session\":\"s\",\"role\":\"X\",\"expires\":9999999999}"), out _));
+        Assert.False(service.TryVerify(SignPayload("{\"session\":\" \",\"role\":\"C\",\"expires\":9999999999}"), out _));
+        Assert.False(service.TryVerify(SignPayload("{\"role\":\"C\",\"expires\":9999999999}"), out _));
     }
 
     private static string SignPayload(string json)

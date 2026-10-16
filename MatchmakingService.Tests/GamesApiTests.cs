@@ -161,7 +161,7 @@ public sealed class GamesApiTests : IClassFixture<GamesApiFactory>
         var publicClaims = DecodePayload(publicToken);
         Assert.Equal("C", publicClaims.GetProperty("role").GetString());
         Assert.Equal(publicGame.SessionId.ToString(), publicClaims.GetProperty("session").GetString());
-        Assert.Equal(JsonValueKind.Null, publicClaims.GetProperty("secretHash").ValueKind);
+        Assert.False(publicClaims.TryGetProperty("secretHash", out _));
 
         var missingSecretJoin = await _client.PostAsJsonAsync("/join", new { session = privateGame.SessionId });
         var badSecretJoin = await _client.PostAsJsonAsync("/join", new { session = privateGame.SessionId, secret = "wrong" });
@@ -173,7 +173,7 @@ public sealed class GamesApiTests : IClassFixture<GamesApiFactory>
         var privateClaims = DecodePayload(privateToken);
         Assert.Equal("C", privateClaims.GetProperty("role").GetString());
         Assert.Equal(privateGame.SessionId.ToString(), privateClaims.GetProperty("session").GetString());
-        Assert.Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(joinSecret))).ToLowerInvariant(), privateClaims.GetProperty("secretHash").GetString());
+        Assert.False(privateClaims.TryGetProperty("secretHash", out _));
         Assert.DoesNotContain(joinSecret, privateToken, StringComparison.Ordinal);
 
         var missingGame = await _client.PostAsJsonAsync("/join", new { session = Guid.NewGuid() });
