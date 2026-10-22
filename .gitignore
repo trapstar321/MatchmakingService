@@ -6,3 +6,10 @@
 *.suo
 .env
 appsettings.Local.json
+# Signing keys and account database must never be committed
+keys/
+*.pem
+data/
+*.db
+*.db-shm
+*.db-wal

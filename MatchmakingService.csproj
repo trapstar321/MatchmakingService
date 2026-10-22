@@ -8,4 +8,8 @@
   <ItemGroup>
     <Compile Remove="MatchmakingService.Tests/**/*.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.20" />
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.14.0" />
+  </ItemGroup>
 </Project>

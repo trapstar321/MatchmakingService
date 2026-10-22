@@ -1,7 +1,5 @@
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.RateLimiting;
@@ -9,6 +7,8 @@ using Microsoft.Extensions.Options;
 using MatchmakingService.Configuration;
 using MatchmakingService.Models;
 using MatchmakingService.Services;
+
+if (SigningKeyCli.TryRun(args, Console.Out, Console.Error)) return;
 
 var builder = WebApplication.CreateBuilder(args);
 var settings = builder.Configuration.GetSection(MatchmakingOptions.SectionName).Get<MatchmakingOptions>() ?? new();
@@ -22,10 +22,24 @@ builder.WebHost.ConfigureKestrel(server =>
     server.Limits.MaxConcurrentConnections = Math.Max(1, settings.MaxConcurrentConnections);
     server.Limits.Http2.MaxStreamsPerConnection = 100;
 });
-builder.Services.AddOptions<MatchmakingOptions>().Bind(builder.Configuration.GetSection(MatchmakingOptions.SectionName)).Validate(options => !string.IsNullOrWhiteSpace(options.TokenSigningKey) && Encoding.UTF8.GetByteCount(options.TokenSigningKey) >= 32, "Matchmaking:TokenSigningKey is required and must contain at least 32 UTF-8 bytes.").Validate(options => options.TokenExpiry > 0, "Matchmaking:TokenExpiry must be a positive number of seconds.").ValidateOnStart();
+builder.Services.AddOptions<MatchmakingOptions>().Bind(builder.Configuration.GetSection(MatchmakingOptions.SectionName))
+    .Validate(options => !string.IsNullOrWhiteSpace(options.DatabasePath), "Matchmaking:DatabasePath is required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.Tokens.Issuer) && !string.IsNullOrWhiteSpace(options.Tokens.ApiAudience), "Matchmaking:Tokens:Issuer and ApiAudience are required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.Tokens.AuthSigningKeyPem) || !string.IsNullOrWhiteSpace(options.Tokens.AuthSigningKeyPath), "Matchmaking:Tokens:AuthSigningKeyPath or AuthSigningKeyPem is required.")
+    .Validate(options => !string.IsNullOrWhiteSpace(options.Tokens.NatSigningKeyPem) || !string.IsNullOrWhiteSpace(options.Tokens.NatSigningKeyPath), "Matchmaking:Tokens:NatSigningKeyPath or NatSigningKeyPem is required.")
+    .Validate(options => options.Tokens.AuthTokenLifetime > TimeSpan.Zero, "Matchmaking:Tokens:AuthTokenLifetime must be positive.")
+    .Validate(options => options.Tokens.ClientTokenLifetime >= TimeSpan.FromSeconds(1) && options.Tokens.HostTokenLifetime >= TimeSpan.FromSeconds(1) && options.Tokens.OwnerTokenLifetime >= TimeSpan.FromSeconds(1), "Matchmaking:Tokens:ClientTokenLifetime, HostTokenLifetime and OwnerTokenLifetime must be at least one second.")
+    .Validate(options => options.LoginProtection.MaxFailedAttempts > 0 && options.LoginProtection.FailureWindow > TimeSpan.Zero && options.LoginProtection.LockoutDuration > TimeSpan.Zero, "Matchmaking:LoginProtection values must be positive.")
+    .ValidateOnStart();
 builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
 builder.Services.AddSingleton<GameRegistry>();
-builder.Services.AddSingleton<TokenService>();
+builder.Services.AddSingleton<SigningKeys>();
+builder.Services.AddSingleton<AuthTokenService>();
+builder.Services.AddSingleton<NatTokenService>();
+builder.Services.AddSingleton<AccountStore>();
+builder.Services.AddSingleton<LoginThrottle>();
+builder.Services.AddSingleton<AccountService>();
+builder.Services.AddHostedService<StartupInitializer>();
 builder.Services.AddHostedService<GameCleanupService>();
 builder.Services.AddRateLimiter(rateLimiter =>
 {
@@ -40,6 +54,8 @@ builder.Services.AddRateLimiter(rateLimiter =>
     rateLimiter.AddPolicy("list-games", context => PerIpPartition(context, GetRateLimits(context).ListPermitLimit, GetRateLimits(context).ListWindow));
     rateLimiter.AddPolicy("heartbeat", context => PerIpPartition(context, GetRateLimits(context).HeartbeatPermitLimit, GetRateLimits(context).HeartbeatWindow));
     rateLimiter.AddPolicy("delete-game", context => PerIpPartition(context, GetRateLimits(context).DeletePermitLimit, GetRateLimits(context).DeleteWindow));
+    rateLimiter.AddPolicy("register", context => PerIpPartition(context, GetRateLimits(context).RegisterPermitLimit, GetRateLimits(context).RegisterWindow));
+    rateLimiter.AddPolicy("login", context => PerIpPartition(context, GetRateLimits(context).LoginPermitLimit, GetRateLimits(context).LoginWindow));
 });
 
 var app = builder.Build();
@@ -103,8 +119,55 @@ app.UseRateLimiter();
 
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
-app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegistry games, TokenService tokens) =>
+app.MapPost("/accounts/register", async (AccountCredentialsRequest? request, AccountService accounts, AuthTokenService authTokens, CancellationToken cancellationToken) =>
 {
+    if (request is null || !AccountService.TryNormalizeEmail(request.Email, out var email) || !AccountService.IsValidPassword(request.Password))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["request"] = [$"A valid email address and a password of {AccountService.MinPasswordLength}-{AccountService.MaxPasswordLength} characters are required."]
+        });
+    }
+
+    if (await accounts.RegisterAsync(email, request.Password!, cancellationToken) is not { } playerId)
+        return Results.Problem(statusCode: StatusCodes.Status409Conflict, title: "An account with this email address already exists.");
+    var authToken = authTokens.Create(playerId);
+    return Results.Json(new AuthResponse(playerId, authToken.Token, authToken.ExpiresAtUtc), statusCode: StatusCodes.Status201Created);
+}).RequireRateLimiting("register");
+
+app.MapPost("/accounts/login", async (AccountCredentialsRequest? request, AccountService accounts, AuthTokenService authTokens, CancellationToken cancellationToken) =>
+{
+    if (request is null || !AccountService.TryNormalizeEmail(request.Email, out var email) ||
+        string.IsNullOrEmpty(request.Password) || request.Password.Length > AccountService.MaxPasswordLength)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["request"] = ["A valid email address and password are required."]
+        });
+    }
+
+    var result = await accounts.LoginAsync(email, request.Password, cancellationToken);
+    if (result.Status == LoginStatus.LockedOut)
+        return Results.Problem(statusCode: StatusCodes.Status429TooManyRequests, title: "Too many failed sign-in attempts. Try again later.");
+    // One generic failure for unknown emails and wrong passwords so account existence is not revealed.
+    if (result.Status != LoginStatus.Success)
+        return Results.Problem(statusCode: StatusCodes.Status401Unauthorized, title: "The email address or password is incorrect.");
+    var authToken = authTokens.Create(result.PlayerId);
+    return Results.Ok(new AuthResponse(result.PlayerId, authToken.Token, authToken.ExpiresAtUtc));
+}).RequireRateLimiting("login");
+
+// Owner (O) token: proves the account to a game server the player owns, for local games and before hosting one.
+app.MapPost("/accounts/owner-token", async (HttpContext context, AuthTokenService authTokens, NatTokenService natTokens) =>
+{
+    if (await AuthenticatePlayerAsync(context, authTokens) is not { } playerId)
+        return Unauthorized(context);
+    return Results.Ok(new OwnerTokenResponse(natTokens.CreateOwnerToken(playerId)));
+}).RequireRateLimiting("join-game");
+
+app.MapPost("/games", async (CreateGameRequest? request, HttpContext context, GameRegistry games, AuthTokenService authTokens, NatTokenService natTokens) =>
+{
+    if (await AuthenticatePlayerAsync(context, authTokens) is not { } hostPlayerId)
+        return Unauthorized(context);
     if (request is null || !CreateGameRequest.IsValid(request))
     {
         return Results.ValidationProblem(new Dictionary<string, string[]>
@@ -115,8 +178,8 @@ app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegi
 
     try
     {
-        var game = games.Register(request.PlayerName!.Trim(), request.GameName!.Trim(), request.GameType!, request.GameType == "private" ? request.Secret : null, context.Connection.RemoteIpAddress);
-        var token = tokens.Create(game.Game.SessionId, "H");
+        var game = games.Register(hostPlayerId, request.PlayerName!.Trim(), request.GameName!.Trim(), request.GameType!, request.GameType == "private" ? request.Secret : null, context.Connection.RemoteIpAddress);
+        var token = natTokens.CreateHostToken(game.Game.SessionId, hostPlayerId);
         return Results.Created($"/games/{game.Game.SessionId}", CreateGameResponse.From(game, token));
     }
     catch (SessionCapacityExceededException)
@@ -125,15 +188,17 @@ app.MapPost("/games", (CreateGameRequest? request, HttpContext context, GameRegi
     }
 }).RequireRateLimiting("create-game");
 
-app.MapPost("/join", (JoinGameRequest? request, GameRegistry games, TokenService tokens) =>
+app.MapPost("/join", async (JoinGameRequest? request, HttpContext context, GameRegistry games, AuthTokenService authTokens, NatTokenService natTokens) =>
 {
+    if (await AuthenticatePlayerAsync(context, authTokens) is not { } playerId)
+        return Unauthorized(context);
     if (request is null || !Guid.TryParse(request.Session, out var sessionId))
         return Results.ValidationProblem(new Dictionary<string, string[]> { ["session"] = ["A valid game session is required."] });
     var authorization = games.AuthorizeJoin(sessionId, request.Secret, out var game);
     if (authorization == JoinGameResult.NotFound) return Results.NotFound();
     if (authorization == JoinGameResult.InvalidCredential)
         return Results.Problem(statusCode: StatusCodes.Status403Forbidden, title: "The private game credentials are invalid.");
-    var token = tokens.Create(game!.SessionId, "C");
+    var token = natTokens.CreateClientToken(game!.SessionId, playerId);
     return Results.Ok(new JoinGameResponse(token));
 }).RequireRateLimiting("join-game");
 app.MapGet("/games", (GameRegistry games) =>
@@ -142,14 +207,14 @@ app.MapGet("/games", (GameRegistry games) =>
 
 app.MapPost("/games/{sessionId:guid}/heartbeat", (Guid sessionId, HttpContext context, GameRegistry games) =>
 {
-    if (!TryGetOwnerSecret(context, settings.MaxAuthorizationHeaderBytes, out var ownerSecret))
+    if (!TryGetBearerCredential(context, settings.MaxAuthorizationHeaderBytes, out var ownerSecret))
         return Unauthorized(context);
     return ToOperationResult(games.Heartbeat(sessionId, ownerSecret));
 }).RequireRateLimiting("heartbeat");
 
 app.MapDelete("/games/{sessionId:guid}", (Guid sessionId, HttpContext context, GameRegistry games) =>
 {
-    if (!TryGetOwnerSecret(context, settings.MaxAuthorizationHeaderBytes, out var ownerSecret))
+    if (!TryGetBearerCredential(context, settings.MaxAuthorizationHeaderBytes, out var ownerSecret))
         return Unauthorized(context);
     return ToOperationResult(games.Delete(sessionId, ownerSecret));
 }).RequireRateLimiting("delete-game");
@@ -178,15 +243,21 @@ string GetClientKey(HttpContext context)
         : (address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address).ToString();
 }
 
-static bool TryGetOwnerSecret(HttpContext context, int maxHeaderBytes, out string ownerSecret)
+// Create and join take an auth token; heartbeat and delete take the session owner secret. Both use Bearer.
+async Task<Guid?> AuthenticatePlayerAsync(HttpContext context, AuthTokenService authTokens) =>
+    TryGetBearerCredential(context, settings.MaxAuthorizationHeaderBytes, out var authToken)
+        ? await authTokens.ValidateAsync(authToken)
+        : null;
+
+static bool TryGetBearerCredential(HttpContext context, int maxHeaderBytes, out string credential)
 {
-    ownerSecret = string.Empty;
+    credential = string.Empty;
     var value = context.Request.Headers.Authorization.ToString();
     if (value.Length == 0 || Encoding.UTF8.GetByteCount(value) > Math.Max(64, maxHeaderBytes)) return false;
     if (!AuthenticationHeaderValue.TryParse(value, out var authorization) ||
         !string.Equals(authorization.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase) ||
         string.IsNullOrWhiteSpace(authorization.Parameter)) return false;
-    ownerSecret = authorization.Parameter;
+    credential = authorization.Parameter;
     return true;
 }
 
@@ -202,62 +273,5 @@ static IResult ToOperationResult(SessionOperationResult result) => result switch
     SessionOperationResult.InvalidCredential => Results.Problem(statusCode: StatusCodes.Status403Forbidden, title: "The owner credential is invalid."),
     _ => Results.NotFound()
 };
-
-// Tokens are signed, not encrypted. Verify the signature before returning the readable payload.
-static JsonDocument VerifyAndDecodeTokenPayload(string? token, string signingKey)
-{
-    if (string.IsNullOrEmpty(token)) throw new InvalidTokenException("Token is missing.");
-    if (string.IsNullOrWhiteSpace(signingKey) || Encoding.UTF8.GetByteCount(signingKey) < 32)
-        throw new ArgumentException("The signing key must contain at least 32 UTF-8 bytes.", nameof(signingKey));
-
-    var parts = token.Split('.');
-    if (parts.Length != 2 || parts[0].Length == 0 ||
-        !TryDecodeBase64Url(parts[0], out var payloadBytes) ||
-        !TryDecodeBase64Url(parts[1], out var suppliedSignature))
-        throw new InvalidTokenException("Token format is invalid.");
-
-    try
-    {
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(signingKey));
-        var expectedSignature = hmac.ComputeHash(Encoding.ASCII.GetBytes(parts[0]));
-        if (suppliedSignature.Length != expectedSignature.Length ||
-            !CryptographicOperations.FixedTimeEquals(suppliedSignature, expectedSignature))
-            throw new InvalidTokenException("Token signature is invalid.");
-
-        var payload = JsonDocument.Parse(payloadBytes);
-        var root = payload.RootElement;
-        
-        // validate expiry later
-        /*if (root.ValueKind != JsonValueKind.Object ||
-            !root.TryGetProperty("expires", out var expiresElement) || !expiresElement.TryGetInt64(out var expires) ||
-            expires <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-        {
-            payload.Dispose();
-            throw new InvalidTokenException("Token payload is invalid or expired.");
-        }*/
-
-        return payload;
-    }
-    catch (JsonException exception) { throw new InvalidTokenException("Token payload is invalid.", exception); }
-}
-
-static bool TryDecodeBase64Url(string value, out byte[] bytes)
-{
-    bytes = [];
-    if (value.Length == 0 || value.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_')) || value.Length % 4 == 1)
-        return false;
-    try
-    {
-        var base64 = value.Replace('-', '+').Replace('_', '/');
-        base64 += new string('=', (4 - base64.Length % 4) % 4);
-        bytes = Convert.FromBase64String(base64);
-        return true;
-    }
-    catch (FormatException) { return false; }
-}
-
-sealed class InvalidTokenException(string message, Exception? innerException = null) : Exception(message, innerException);
-
-sealed record DecodeTokenRequest(string? Token);
 
 public partial class Program;

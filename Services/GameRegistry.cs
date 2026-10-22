@@ -34,10 +34,13 @@ internal sealed class GameRegistry(
     private readonly int _maxActiveSessions = Math.Max(1, options.Value.MaxActiveSessions);
     private readonly int _maxSessionsPerIp = Math.Max(1, options.Value.MaxSessionsPerIp);
 
-    internal GameRegistration Register(string playerName, string gameName, IPAddress? sourceAddress) => Register(playerName, gameName, "public", null, sourceAddress);
+    internal GameRegistration Register(Guid hostPlayerId, string playerName, string gameName, IPAddress? sourceAddress) =>
+        Register(hostPlayerId, playerName, gameName, "public", null, sourceAddress);
 
-    internal GameRegistration Register(string playerName, string gameName, string gameType, string? joinSecret, IPAddress? sourceAddress)
+    // hostPlayerId must come from the authenticated auth token, never from the request body.
+    internal GameRegistration Register(Guid hostPlayerId, string playerName, string gameName, string gameType, string? joinSecret, IPAddress? sourceAddress)
     {
+        if (hostPlayerId == Guid.Empty) throw new ArgumentException("A host player ID is required.", nameof(hostPlayerId));
         lock (_gate)
         {
             var now = timeProvider.GetUtcNow();
@@ -53,14 +56,14 @@ internal sealed class GameRegistry(
             var secret = Convert.ToBase64String(secretBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
             var secretHash = SHA256.HashData(Encoding.UTF8.GetBytes(secret));
             CryptographicOperations.ZeroMemory(secretBytes);
-            var game = new HostedGame(Guid.NewGuid(), playerName, gameName, gameType, joinSecret, now, now);
+            var game = new HostedGame(Guid.NewGuid(), hostPlayerId, playerName, gameName, gameType, joinSecret, now, now);
             while (_games.ContainsKey(game.SessionId))
             {
                 game = game with { SessionId = Guid.NewGuid() };
             }
 
             _games.Add(game.SessionId, new Session(game, secretHash, sourceKey));
-            logger.LogInformation("Registered hosted game {SessionId}", game.SessionId);
+            logger.LogInformation("Registered hosted game {SessionId} for host {HostPlayerId}", game.SessionId, hostPlayerId);
             return new GameRegistration(game, secret);
         }
     }

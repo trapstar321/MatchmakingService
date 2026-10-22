@@ -21,10 +21,11 @@ public sealed class SecurityControlsTests
     {
         using var factory = new RateLimitFactory();
         using var client = factory.CreateClient();
+        var auth = (await TestApi.RegisterAsync(client)).AuthToken;
 
-        var first = await CreateWithForwardedIp(client, "one");
-        var second = await CreateWithForwardedIp(client, "two");
-        var third = await CreateWithForwardedIp(client, "three");
+        var first = await CreateWithForwardedIp(client, auth, "one");
+        var second = await CreateWithForwardedIp(client, auth, "two");
+        var third = await CreateWithForwardedIp(client, auth, "three");
 
         Assert.Equal(HttpStatusCode.Created, first.StatusCode);
         Assert.Equal(HttpStatusCode.Created, second.StatusCode);
@@ -47,8 +48,9 @@ public sealed class SecurityControlsTests
     {
         using var factory = new CapacityFactory();
         using var client = factory.CreateClient();
+        var auth = (await TestApi.RegisterAsync(client)).AuthToken;
         var requests = Enumerable.Range(0, 20).Select(i =>
-            client.PostAsJsonAsync("/games", new CreateGameRequest($"p{i}", $"g{i}"))).ToArray();
+            TestApi.PostAsync(client, "/games", new CreateGameRequest($"p{i}", $"g{i}"), auth)).ToArray();
         var responses = await Task.WhenAll(requests);
 
         Assert.Single(responses, response => response.StatusCode == HttpStatusCode.Created);
@@ -71,13 +73,30 @@ public sealed class SecurityControlsTests
         Assert.DoesNotContain("MatchmakingService", body, StringComparison.Ordinal);
     }
 
-    private class ConfiguredFactory : WebApplicationFactory<Program>
+    [Fact]
+    public async Task Login_and_register_have_per_ip_rate_limits()
+    {
+        using var factory = new AccountRateLimitFactory();
+        using var client = factory.CreateClient();
+
+        Assert.Equal(HttpStatusCode.Created, (await client.PostAsJsonAsync("/accounts/register", new { email = TestApi.NewEmail(), password = TestApi.Password })).StatusCode);
+        Assert.Equal(HttpStatusCode.TooManyRequests, (await client.PostAsJsonAsync("/accounts/register", new { email = TestApi.NewEmail(), password = TestApi.Password })).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync("/accounts/login", new { email = TestApi.NewEmail(), password = TestApi.Password })).StatusCode);
+        Assert.Equal(HttpStatusCode.TooManyRequests, (await client.PostAsJsonAsync("/accounts/login", new { email = TestApi.NewEmail(), password = TestApi.Password })).StatusCode);
+    }
+
+    private class ConfiguredFactory : MatchmakingFactory;
+
+    private sealed class AccountRateLimitFactory : ConfiguredFactory
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
-            builder.UseEnvironment("Production");
-            builder.ConfigureLogging(logging => logging.ClearProviders());
-            builder.ConfigureAppConfiguration((_, config) => config.AddInMemoryCollection(TestSettings.HighLimits));
+            base.ConfigureWebHost(builder);
+            builder.ConfigureServices(services => services.PostConfigure<MatchmakingOptions>(options =>
+            {
+                options.RateLimits.RegisterPermitLimit = 1;
+                options.RateLimits.LoginPermitLimit = 1;
+            }));
         }
     }
 
@@ -134,13 +153,14 @@ public sealed class SecurityControlsTests
         public override DateTimeOffset GetUtcNow() => throw new InvalidOperationException("internal-secret-sentinel");
     }
 
-    private static async Task<HttpResponseMessage> CreateWithForwardedIp(HttpClient client, string playerName)
+    private static async Task<HttpResponseMessage> CreateWithForwardedIp(HttpClient client, string authToken, string playerName)
     {
         var request = new HttpRequestMessage(HttpMethod.Post, "/games")
         {
             Content = JsonContent.Create(new CreateGameRequest(playerName, "game"))
         };
         request.Headers.TryAddWithoutValidation("X-Forwarded-For", $"198.51.100.{playerName.Length}");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
         return await client.SendAsync(request);
     }
 
